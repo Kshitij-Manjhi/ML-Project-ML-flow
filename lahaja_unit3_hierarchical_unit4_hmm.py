@@ -4,13 +4,13 @@ import time
 import warnings
 from pathlib import Path
 
-import librosa  # MFCC Mel-Frequency Cepstral Coefficient liberary
-import mlflow   # Hyperparameter tuning
+import librosa
+import mlflow
 import numpy as np
 import pandas as pd
 import soundfile as sf
-from hmmlearn.hmm import GaussianHMM    # model Unit 4 Gausiam Hidden Markov Chain model
-from sklearn.cluster import AgglomerativeClustering # model Unit 3 Agglomerative Clustering
+from hmmlearn.hmm import GaussianHMM
+from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics import (
     calinski_harabasz_score,
     davies_bouldin_score,
@@ -21,7 +21,7 @@ from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings("ignore")
 
-# load dataset path
+
 def load_lahaja_data(data_path):
     path = Path(data_path)
 
@@ -48,7 +48,7 @@ def load_lahaja_data(data_path):
 
     return df.reset_index(drop=True)
 
-# find and read audio file
+
 def read_audio(audio_object):
     if isinstance(audio_object, dict):
         audio_bytes = audio_object.get("bytes")
@@ -76,8 +76,8 @@ def read_audio(audio_object):
 
     return audio.astype(np.float32), sr
 
-# MFCC extraction of audio
-def extract_mfcc_sequence(audio_object, n_mfcc=13, max_frames=120): # MFCC Mel-Frequency Cepstral Coefficient 13 features
+
+def extract_mfcc_sequence(audio_object, n_mfcc=13, max_frames=120):
     audio, sr = read_audio(audio_object)
 
     if len(audio) < int(sr * 0.25):
@@ -97,10 +97,10 @@ def extract_mfcc_sequence(audio_object, n_mfcc=13, max_frames=120): # MFCC Mel-F
 
     return mfcc.astype(np.float64)
 
-# extract features of dataset
+
 def extract_dataset_features(df, max_samples):
     if max_samples and len(df) > max_samples:
-        df = df.sample(max_samples, random_state=42).reset_index(drop=True) # for repeated same output
+        df = df.sample(max_samples, random_state=42).reset_index(drop=True)
 
     sequences = []
     kept_rows = []
@@ -123,7 +123,7 @@ def extract_dataset_features(df, max_samples):
 
     return pd.DataFrame(kept_rows).reset_index(drop=True), sequences
 
-# Unit 3 Hierarchial Clustering Optimiation
+
 def run_hierarchical_optimization(df, sequences):
     print("\nUNIT 3 — Hierarchical Clustering Optimization")
 
@@ -154,7 +154,7 @@ def run_hierarchical_optimization(df, sequences):
                         n_clusters=n_clusters,
                         linkage=linkage,
                     )
-                    labels = model.fit_predict(X)  # training model
+                    labels = model.fit_predict(X)
                     elapsed = time.time() - start
                     unique_labels = np.unique(labels)
 
@@ -178,9 +178,9 @@ def run_hierarchical_optimization(df, sequences):
                     results.append({
                         "linkage": linkage,
                         "n_clusters": n_clusters,
-                        "silhouette_score": silhouette, # -1 to 1 Higher is better
-                        "davies_bouldin_score": db_score, # lower si beetter
-                        "calinski_harabasz_score": ch_score, # higher beter
+                        "silhouette_score": silhouette,
+                        "davies_bouldin_score": db_score,
+                        "calinski_harabasz_score": ch_score,
                         "fit_time_seconds": elapsed,
                     })
 
@@ -198,12 +198,12 @@ def run_hierarchical_optimization(df, sequences):
     print(results_df.iloc[0].to_string())
     print("Results saved to unit3_hierarchical_results.csv")
 
-# Unit 4 Gaussian Hidden Markov Model
+
 def run_hmm_optimization(df, sequences):
     print("\nUNIT 4 — Gaussian Hidden Markov Model Optimization")
 
     speaker_groups = df["sp_id"].astype(str).to_numpy()
-    splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42) # repeatable to produce same ouutput
+    splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
     train_idx, test_idx = next(
         splitter.split(np.arange(len(sequences)), groups=speaker_groups)
     )
@@ -224,7 +224,7 @@ def run_hmm_optimization(df, sequences):
     mlflow.set_experiment("LAHAJA_Unit4_Gaussian_HMM")
 
     results = []
-    state_counts = [3, 5, 8, 10, 12] # number of states
+    state_counts = [3, 5, 8, 10, 12]
 
     with mlflow.start_run(run_name="Gaussian_HMM_Optimization"):
         mlflow.log_param("feature_type", "frame_level_MFCC")
@@ -239,7 +239,7 @@ def run_hmm_optimization(df, sequences):
             ):
                 model = GaussianHMM(
                     n_components=n_states,
-                    covariance_type="diag", # diagonal cov matrix
+                    covariance_type="diag",
                     n_iter=100,
                     tol=0.01,
                     random_state=42,
@@ -315,7 +315,7 @@ def main():
     )
     parser.add_argument(
         "--data",
-        default=r"D:\ML project\Lahaja dataset",    # Dataset Path
+        default=r"D:\ML project\Lahaja dataset",
         help="Path to your LAHAJA dataset folder.",
     )
     parser.add_argument(
