@@ -1,0 +1,240 @@
+
+# ---------------- CONFIG ----------------
+MAX_CLIPS_PER_FILE = 200   # 200 = quick test, None = use every clip
+SEED = 42
+SR = 16000          # sample rate used for features
+MAX_SEC = 12        # only the first 12 s of each clip are used
+MIN_CLIPS_PER_LANG = 8
+TEST_SIZE = 0.25
+REQUIRED = [f"test-0000{i}-of-00004.parquet" for i in range(4)]
+
+import os, io, glob, re, pickle, warnings, time
+import numpy as np, pandas as pd
+import matplotlib.pyplot as plt
+import pyarrow.parquet as pq
+warnings.filterwarnings("ignore")
+np.random.seed(SEED)
+
+import mlflow
+mlflow.set_tracking_uri("sqlite:///mlflow.db")
+mlflow.set_experiment("LAHAJA_Unit5_CART_RF_AdaBoost")
+
+try:
+    from google.colab import drive
+    drive.mount('/content/drive')
+    IN_COLAB = True
+except Exception:
+    IN_COLAB = False
+
+TEST_DIR = r"D:\ML project\Lahaja dataset"  # folder containing the 4 parquet files
+search_dirs = [TEST_DIR] if TEST_DIR else ['/content/drive/MyDrive/LAHAJA', '/content/drive/MyDrive', '/content', '.']
+files = []
+for d in search_dirs:
+    files = [p for p in sorted(glob.glob(os.path.join(d, '**', 'test-0000*-of-00004.parquet'), recursive=True))]
+    if files: break
+if not files and IN_COLAB:
+    from google.colab import files as cf
+    print("Parquet files not found. Please upload the 4 files.")
+    cf.upload()
+    files = sorted(glob.glob('/content/test-0000*-of-00004.parquet'))
+assert files, "No parquet files found. Put them in MyDrive/LAHAJA/"
+missing = [r for r in REQUIRED if r not in [os.path.basename(f) for f in files]]
+print("Found:", [os.path.basename(f) for f in files])
+if missing: print("WARNING missing:", missing)
+
+import soundfile as sf, librosa
+
+HOP, NFFT = 320, 512   # 20 ms hop, 32 ms window at 16 kHz
+
+def decode(raw):
+    try:
+        y, sr = sf.read(io.BytesIO(raw), dtype='float32')
+    except Exception:
+        y, sr = librosa.load(io.BytesIO(raw), sr=None)
+    if y.ndim > 1: y = y.mean(1)
+    if sr != SR: y = librosa.resample(y, orig_sr=sr, target_sr=SR)
+    y = y[:SR * MAX_SEC]
+    if len(y) < SR // 2: y = np.pad(y, (0, SR // 2 - len(y)))
+    return y
+
+def acoustic_features(raw):
+    y = decode(raw)
+    mf = librosa.feature.mfcc(y=y, sr=SR, n_mfcc=13, n_fft=NFFT, hop_length=HOP)
+    d = librosa.feature.delta(mf)
+    spec = {
+        'spec_centroid': librosa.feature.spectral_centroid(y=y, sr=SR, n_fft=NFFT, hop_length=HOP)[0],
+        'spec_bandwidth': librosa.feature.spectral_bandwidth(y=y, sr=SR, n_fft=NFFT, hop_length=HOP)[0],
+        'spec_rolloff': librosa.feature.spectral_rolloff(y=y, sr=SR, n_fft=NFFT, hop_length=HOP)[0],
+        'spec_zcr': librosa.feature.zero_crossing_rate(y, frame_length=NFFT, hop_length=HOP)[0],
+        'spec_rms': librosa.feature.rms(y=y, frame_length=NFFT, hop_length=HOP)[0],
+    }
+    f = {}
+    for i in range(13):
+        f[f'mfcc{i}_mean'] = mf[i].mean(); f[f'mfcc{i}_std'] = mf[i].std(); f[f'dmfcc{i}_mean'] = d[i].mean()
+    for k, v in spec.items():
+        f[k + '_mean'] = v.mean(); f[k + '_std'] = v.std()
+    return f, mf.T.astype(np.float32)
+
+def load_structured(files, n_per_file, seed=SEED):
+    rng = np.random.default_rng(seed)
+    rows, seqs = [], []
+    for fp in files:
+        pf = pq.ParquetFile(fp)
+        n_rg = pf.num_row_groups
+        per_rg = None if n_per_file is None else int(np.ceil(n_per_file / n_rg))
+        got = 0
+        for g in range(n_rg):
+            if n_per_file is not None and got >= n_per_file: break
+            df_g = pf.read_row_group(g).to_pandas()
+            if per_rg is not None and len(df_g) > per_rg:
+                df_g = df_g.iloc[np.sort(rng.choice(len(df_g), per_rg, replace=False))]
+            for _, r in df_g.iterrows():
+                if n_per_file is not None and got >= n_per_file: break
+                try:
+                    feats, seq = acoustic_features(r['audio_filepath']['bytes'])
+                except Exception as e:
+                    print("skip clip:", e); continue
+                meta = {k: r[k] for k in df_g.columns if k != 'audio_filepath'}
+                meta['source_file'] = os.path.basename(fp)
+                rows.append({**meta, **feats}); seqs.append(seq); got += 1
+        print(f"{os.path.basename(fp)}: {got} clips")
+    return pd.DataFrame(rows), seqs
+
+tag = 'all' if MAX_CLIPS_PER_FILE is None else str(MAX_CLIPS_PER_FILE)
+CACHE = f'lahaja_cache_{tag}.pkl'
+if os.path.exists(CACHE):
+    df, seqs = pickle.load(open(CACHE, 'rb')); print("Loaded cache", CACHE)
+else:
+    t0 = time.time()
+    df, seqs = load_structured(files, MAX_CLIPS_PER_FILE)
+    pickle.dump((df, seqs), open(CACHE, 'wb'))
+    print(f"Feature extraction took {time.time()-t0:.0f}s")
+print(df.shape)
+
+# ---- text features + cleaning ----
+for c in ['native_language', 'gender', 'age_group', 'native_state', 'native_district', 'scenario', 'sp_id']:
+    if c in df.columns: df[c] = df[c].astype(str).str.strip()
+txt = df['normalized'].where(df['normalized'].notna() & (df['normalized'].astype(str).str.len() > 0), df['text']).fillna('').astype(str)
+words = txt.str.split()
+df['n_words'] = words.str.len()
+df['n_chars'] = txt.str.len()
+df['avg_word_len'] = df['n_chars'] / df['n_words'].clip(lower=1)
+df['uniq_ratio'] = words.apply(lambda w: len(set(w)) / max(len(w), 1))
+df['speech_rate'] = df['n_words'] / df['duration'].clip(lower=0.1)
+
+# keep languages with enough clips
+vc = df['native_language'].value_counts()
+keep = vc[vc >= MIN_CLIPS_PER_LANG].index
+mask = df['native_language'].isin(keep).values
+df = df[mask].reset_index(drop=True); seqs = [s for s, m in zip(seqs, mask) if m]
+classes = sorted(df['native_language'].unique())
+df['lang_id'] = df['native_language'].map({c: i for i, c in enumerate(classes)})
+df['is_male'] = df['gender'].str.lower().str.startswith('m').astype(int)
+
+acoustic_cols = [c for c in df.columns if c.startswith(('mfcc', 'dmfcc', 'spec_'))]
+text_cols = ['n_words', 'n_chars', 'avg_word_len', 'uniq_ratio', 'speech_rate']
+feat_cols = acoustic_cols + text_cols
+df.to_csv('lahaja_structured.csv', index=False)
+pickle.dump(seqs, open('lahaja_mfcc_sequences.pkl', 'wb'))
+print("Languages:", classes)
+print("Structured dataset:", df.shape, "| feature columns:", len(feat_cols))
+print(df.head())
+
+from sklearn.model_selection import GroupShuffleSplit, GroupKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix, ConfusionMatrixDisplay
+
+gss = GroupShuffleSplit(n_splits=1, test_size=TEST_SIZE, random_state=SEED)
+tr, te = next(gss.split(df, df['lang_id'], groups=df['sp_id']))
+te = np.array([i for i in te if df.loc[i, 'lang_id'] in set(df.loc[tr, 'lang_id'])])
+assert set(df.loc[tr,'sp_id']).isdisjoint(set(df.loc[te,'sp_id']))
+tr_df, te_df = df.iloc[tr], df.iloc[te]
+y_tr, y_te = tr_df['lang_id'].values, te_df['lang_id'].values
+g_tr = tr_df['sp_id'].values
+scaler = StandardScaler().fit(tr_df[feat_cols])
+Xtr = scaler.transform(tr_df[feat_cols]); Xte = scaler.transform(te_df[feat_cols])
+print("train", Xtr.shape, "test", Xte.shape, "| speakers train/test:", tr_df.sp_id.nunique(), te_df.sp_id.nunique())
+print("Chance level accuracy ~", round(1/len(classes), 3))
+
+results = []
+def evaluate(name, model, fit=True, Xa=None, Xb=None):
+    Xa = Xtr if Xa is None else Xa; Xb = Xte if Xb is None else Xb
+    t0 = time.time()
+    with mlflow.start_run(run_name=name):
+        if fit: model.fit(Xa, y_tr)
+        p = model.predict(Xb)
+        acc, f1 = accuracy_score(y_te, p), f1_score(y_te, p, average='macro')
+        mlflow.log_param("model", type(model).__name__)
+        for k in ["ccp_alpha", "n_estimators", "learning_rate", "max_depth"]:
+            if k in model.get_params():
+                mlflow.log_param(k, model.get_params()[k])
+        mlflow.log_param("split_type", "speaker_group_split")
+        mlflow.log_metric("test_accuracy", float(acc))
+        mlflow.log_metric("test_macro_f1", float(f1))
+        mlflow.log_metric("train_samples", len(y_tr))
+        mlflow.log_metric("test_samples", len(y_te))
+        mlflow.log_metric("fit_time_seconds", time.time() - t0)
+        if hasattr(model, "get_depth"):
+            mlflow.log_metric("tree_depth", model.get_depth())
+            mlflow.log_metric("n_leaves", model.get_n_leaves())
+    results.append((name, acc, f1)); print(f"{name:35s} acc={acc:.3f}  macroF1={f1:.3f}")
+    return model
+
+'''# Part A: CART (Classification and Regression Tree)
+A single tree that splits on feature thresholds. It is trained unpruned and then pruned with cost-complexity pruning; the pruning strength is chosen by speaker-grouped cross-validation.
+'''
+
+from sklearn.tree import DecisionTreeClassifier, plot_tree
+path = DecisionTreeClassifier(random_state=SEED).cost_complexity_pruning_path(Xtr, y_tr)
+alphas = np.unique(np.quantile(path.ccp_alphas, np.linspace(0, 0.9, 8)))
+gkf = GroupKFold(n_splits=3); cv_scores = []
+for a in alphas:
+    s = []
+    for a_i, b_i in gkf.split(Xtr, y_tr, g_tr):
+        t = DecisionTreeClassifier(ccp_alpha=a, random_state=SEED).fit(Xtr[a_i], y_tr[a_i]); s.append(t.score(Xtr[b_i], y_tr[b_i]))
+    cv_scores.append(np.mean(s))
+best_a = alphas[int(np.argmax(cv_scores))]
+print("best ccp_alpha:", round(best_a, 5))
+evaluate('CART (unpruned)', DecisionTreeClassifier(random_state=SEED));
+cart = evaluate('CART (pruned)', DecisionTreeClassifier(ccp_alpha=best_a, random_state=SEED))
+print("Pruned tree: depth =", cart.get_depth(), "| leaves =", cart.get_n_leaves())
+plt.figure(figsize=(16, 7))
+plot_tree(DecisionTreeClassifier(ccp_alpha=best_a, random_state=SEED, max_depth=3).fit(Xtr, y_tr),
+          feature_names=feat_cols, class_names=classes, filled=True, fontsize=7)
+plt.title("Top 3 levels of the CART tree"); plt.show()
+
+"""## Part B: Random forest
+Many trees trained on bootstrap samples with random feature selection, combined by voting. It reduces the variance of a single tree.
+"""
+
+from sklearn.ensemble import RandomForestClassifier
+rf = evaluate('Random forest', RandomForestClassifier(n_estimators=300, random_state=SEED, n_jobs=-1))
+imp = pd.Series(rf.feature_importances_, index=feat_cols).sort_values(ascending=False)[:15]
+imp[::-1].plot.barh(title='Random forest: top 15 features', figsize=(6, 5)); plt.show()
+
+"""## Part C: AdaBoost
+Weak trees (stumps) are trained one after another; each one focuses on the examples the earlier ones got wrong. It reduces bias.
+"""
+
+from sklearn.ensemble import AdaBoostClassifier
+ada = evaluate('AdaBoost', AdaBoostClassifier(n_estimators=200, learning_rate=0.5, random_state=SEED))
+
+# Comparison
+
+res = pd.DataFrame(results, columns=['model', 'accuracy', 'macro_F1']).sort_values('accuracy', ascending=False).reset_index(drop=True)
+print(res.round(3))
+res.set_index('model')['accuracy'][::-1].plot.barh(figsize=(7, 3.5), title='Test accuracy (speaker-independent)')
+plt.axvline(1/len(classes), color='r', ls='--', label='chance'); plt.legend(); plt.show()
+res.to_csv('lahaja_unit5_comparison.csv', index=False)
+best = {'CART (unpruned)': None, 'CART (pruned)': cart, 'Random forest': rf, 'AdaBoost': ada}
+best_name = res.loc[res['model'] != 'CART (unpruned)', 'model'].iloc[0]
+mdl = best[best_name]; pb = mdl.predict(Xte); print("Best model:", best_name)
+print(classification_report(y_te, pb, labels=range(len(classes)), target_names=classes, zero_division=0))
+fig, ax = plt.subplots(figsize=(9, 8))
+ConfusionMatrixDisplay(confusion_matrix(y_te, pb, labels=range(len(classes))), display_labels=classes).plot(ax=ax, xticks_rotation=90, colorbar=False)
+plt.tight_layout(); plt.show()
+
+print("\nDone. To open the MLflow UI, run this in the terminal (same folder):")
+print("    python -m mlflow ui --backend-store-uri sqlite:///mlflow.db")
+print("Then open http://localhost:5000")
